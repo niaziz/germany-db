@@ -1,0 +1,111 @@
+
+# ==============================
+# Dependencies
+# ==============================
+
+node_modules/
+.next/
+.env*
+!.env.example
+.pnp/
+.pnp.js
+# ==============================
+# Next.js
+# ==============================
+.next/
+out/
+build/
+next-env.d.ts
+
+# ==============================
+# Production builds
+# ==============================
+dist/
+coverage/
+
+# ==============================
+# Environment variables
+# ==============================
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# ==============================
+# Debug logs
+# ==============================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==============================
+# TypeScript
+# ==============================
+*.tsbuildinfo
+
+# ==============================
+# VS Code
+# ==============================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# ==============================
+# IDE files
+# ==============================
+.idea/
+*.swp
+*.swo
+*.swn
+*.sublime-workspace
+*.sublime-project
+
+# ==============================
+# Operating system files
+# ==============================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+# ==============================
+# Testing
+# ==============================
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+cypress/videos/
+cypress/screenshots/
+
+# ==============================
+# Cache
+# ==============================
+.cache/
+.turbo/
+.vercel/cache/
+.eslintcache
+.stylelintcache
+
+# ==============================
+# Vercel
+# ==============================
+.vercel/
+
+# ==============================
+# Miscellaneous
+# ==============================
+*.log
+*.pid
+*.seed
+*.tmp
+*.bak
+*.orig
+*.lockb
+node_modules/
+.next/
