@@ -1,40 +1,63 @@
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-const RAIL_MODES = new Set([
+// Only real trains (no trams / subways) -> much smaller, faster response
+const MODES = new Set([
   "HIGHSPEED_RAIL",
   "LONG_DISTANCE",
   "NIGHT_RAIL",
-  "REGIONAL_RAIL",
   "REGIONAL_FAST_RAIL",
+  "REGIONAL_RAIL",
   "SUBURBAN",
-  "METRO",
-  "TRAM",
 ]);
 
-let cache: { time: number; body: unknown } | null = null;
+const ZOOM = "7"; // lower = fewer trains (e.g. 7 = mostly long distance)
+const WINDOW_MIN = 2; // short time window = small payload
+const FRESH_MS = 25_000; // serve straight from cache for 25 s
+const STALE_MS = 180_000; // after that: answer instantly from old cache, refresh in background
+const MAX_POLYLINE_POINTS = 80;
 
-function decodePolyline(encoded: string, precision = 5): [number, number][] {
+type Seg = {
+  id: string;
+  name: string;
+  mode: string;
+  from: string;
+  to: string;
+  dep: number;
+  arr: number;
+  sdep: number;
+  sarr: number;
+  pts: number[]; // flat [lon, lat, lon, lat, ...]
+  tripId: string;
+  head: string;
+  fromId: string;
+  toId: string;
+};
+
+let cache: {
+  time: number;
+  body: { segments: Seg[]; fetchedAt: number };
+} | null = null;
+let inflight: Promise<void> | null = null;
+
+function decodePolyline(encoded: string, precision = 4): number[] {
   const factor = 10 ** precision;
   let index = 0;
-  let latitude = 0;
-  let longitude = 0;
-  const coordinates: [number, number][] = [];
-
+  let lat = 0;
+  let lon = 0;
+  const out: number[] = [];
   while (index < encoded.length) {
     let result = 0;
     let shift = 0;
     let byte: number;
-
     do {
       byte = encoded.charCodeAt(index++) - 63;
       result |= (byte & 0x1f) << shift;
       shift += 5;
     } while (byte >= 0x20);
-
-    latitude += result & 1 ? -(result >> 1) : result >> 1;
-
+    lat += result & 1 ? -(result >> 1) : result >> 1;
     result = 0;
     shift = 0;
     do {
@@ -42,141 +65,123 @@ function decodePolyline(encoded: string, precision = 5): [number, number][] {
       result |= (byte & 0x1f) << shift;
       shift += 5;
     } while (byte >= 0x20);
-
-    longitude += result & 1 ? -(result >> 1) : result >> 1;
-    coordinates.push([longitude / factor, latitude / factor]);
+    lon += result & 1 ? -(result >> 1) : result >> 1;
+    out.push(lon / factor, lat / factor);
   }
-
-  return coordinates;
+  return out;
 }
 
-function haversine(a: [number, number], b: [number, number]) {
-  const rad = Math.PI / 180;
-  const lat1 = a[1] * rad;
-  const lat2 = b[1] * rad;
-  const dLat = (b[1] - a[1]) * rad;
-  const dLon = (b[0] - a[0]) * rad;
-  const sinLat = Math.sin(dLat / 2);
-  const sinLon = Math.sin(dLon / 2);
-  const h = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
-  return 6371000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+function simplifyPolyline(points: number[], maxPoints = MAX_POLYLINE_POINTS): number[] {
+  const pointCount = points.length / 2;
+  if (pointCount <= maxPoints) return points;
+
+  const out: number[] = [];
+  const step = (pointCount - 1) / (maxPoints - 1);
+  for (let i = 0; i < maxPoints; i++) {
+    const pointIndex = Math.min(pointCount - 1, Math.round(i * step)) * 2;
+    out.push(points[pointIndex], points[pointIndex + 1]);
+  }
+  return out;
 }
 
-function positionAtPolyline(points: [number, number][], fraction: number) {
-  if (points.length === 0) return null;
-  if (points.length === 1) return points[0];
-
-  const distances = points
-    .slice(1)
-    .map((point, index) => haversine(points[index], point));
-  const total = distances.reduce((sum, value) => sum + value, 0);
-  if (!total) return points[0];
-
-  let target = Math.max(0, Math.min(1, fraction)) * total;
-  for (let index = 0; index < distances.length; index++) {
-    if (target <= distances[index]) {
-      const ratio = target / distances[index];
-      const from = points[index];
-      const to = points[index + 1];
-      return [
-        from[0] + (to[0] - from[0]) * ratio,
-        from[1] + (to[1] - from[1]) * ratio,
-      ] as [number, number];
-    }
-    target -= distances[index];
-  }
-
-  return points.at(-1) ?? null;
-}
-
-export async function GET() {
-  if (cache && Date.now() - cache.time < 20_000) {
-    return NextResponse.json(cache.body, {
-      headers: { "Cache-Control": "public, max-age=20" },
-    });
-  }
-
+async function load() {
   const now = new Date();
-  const end = new Date(now.getTime() + 45 * 60_000);
+  const end = new Date(now.getTime() + WINDOW_MIN * 60_000);
   const params = new URLSearchParams({
-    zoom: "7",
+    zoom: ZOOM,
     min: "47.2,5.8",
     max: "55.1,15.2",
     startTime: now.toISOString(),
     endTime: end.toISOString(),
     precision: "4",
-    language: "en",
+    language: "de",
   });
 
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25_000);
   try {
-    const response = await fetch(
+    const res = await fetch(
       `https://api.transitous.org/api/v6/map/trips?${params}`,
       {
         headers: {
           Accept: "application/json",
-          "User-Agent": "Orbit-Earth-Explorer/1.0",
+          "User-Agent": "germany-live-trains/1.0",
         },
-        next: { revalidate: 20 },
+        signal: ctrl.signal,
+        cache: "no-store",
       },
     );
+    if (!res.ok) throw new Error(`Transitous returned ${res.status}`);
+    const payload = await res.json();
+    if (!Array.isArray(payload)) {
+      throw new Error("Transitous returned an invalid response");
+    }
+    const raw = payload as any[];
 
-    if (!response.ok) throw new Error(`Transitous returned ${response.status}`);
-    const segments = (await response.json()) as Array<{
-      mode: string;
-      departure: string;
-      arrival: string;
-      scheduledDeparture: string;
-      polyline: string;
-      trips?: Array<{ displayName?: string }>;
-    }>;
+    const segments: Seg[] = [];
+    for (const s of raw) {
+      if (!MODES.has(s.mode) || !s.polyline) continue;
+      const dep = Date.parse(s.departure);
+      const arr = Date.parse(s.arrival);
+      if (!(arr > dep)) continue;
+      const pts = simplifyPolyline(decodePolyline(s.polyline, 4));
+      if (pts.length < 4) continue;
+      const trip = s.trips?.[0];
+      const name =
+        trip?.displayName ||
+        trip?.routeShortName ||
+        String(s.mode).replaceAll("_", " ");
+      segments.push({
+        id: `${name}|${dep}|${pts[0]}`,
+        name,
+        mode: s.mode,
+        from: s.from?.name || "",
+        to: s.to?.name || "",
+        dep,
+        arr,
+        sdep: Date.parse(s.scheduledDeparture) || dep,
+        sarr: Date.parse(s.scheduledArrival) || arr,
+        pts,
+        tripId: String(trip?.tripId || name),
+        head: String(trip?.headsign || s.headsign || trip?.tripTo?.name || ""),
+        fromId: String(s.from?.stopId || ""),
+        toId: String(s.to?.stopId || ""),
+      });
+    }
+    cache = { time: Date.now(), body: { segments, fetchedAt: Date.now() } };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-    const nowMs = Date.now();
-    const features = segments
-      .filter((segment) => RAIL_MODES.has(segment.mode) && segment.polyline)
-      .map((segment) => {
-        const departure = Date.parse(segment.departure);
-        const arrival = Date.parse(segment.arrival);
-        const fraction =
-          arrival > departure ? (nowMs - departure) / (arrival - departure) : 0;
-        if (fraction < 0 || fraction > 1) return null;
-
-        const points = decodePolyline(segment.polyline, 4);
-        const position = positionAtPolyline(points, fraction);
-        if (!position) return null;
-
-        return {
-          type: "Feature",
-          geometry: { type: "Point", coordinates: position },
-          properties: {
-            name:
-              segment.trips?.[0]?.displayName ||
-              segment.mode.replaceAll("_", " "),
-            mode: segment.mode,
-            realtime: true,
-            updated: now.toISOString(),
-          },
-        };
-      })
-      .filter(
-        (feature): feature is NonNullable<typeof feature> => feature !== null,
-      );
-
-    const body = { type: "FeatureCollection", features };
-    cache = { time: Date.now(), body };
-    return NextResponse.json(body, {
-      headers: { "Cache-Control": "public, max-age=20" },
+function refresh() {
+  if (!inflight) {
+    inflight = load().finally(() => {
+      inflight = null;
     });
-  } catch (error) {
-    return NextResponse.json(
-      {
-        type: "FeatureCollection",
-        features: [],
-        error:
-          error instanceof Error
-            ? error.message
-            : "Live train feed unavailable",
-      },
-      { status: 200, headers: { "Cache-Control": "no-store" } },
-    );
+  }
+  return inflight;
+}
+
+export async function GET() {
+  const age = cache ? Date.now() - cache.time : Infinity;
+
+  if (cache && age < FRESH_MS) return NextResponse.json(cache.body);
+
+  if (cache && age < STALE_MS) {
+    refresh().catch(() => undefined); // update in background, answer instantly
+    return NextResponse.json(cache.body);
+  }
+
+  try {
+    await refresh();
+    return NextResponse.json(cache!.body);
+  } catch (e) {
+    if (cache) return NextResponse.json(cache.body);
+    return NextResponse.json({
+      segments: [],
+      fetchedAt: Date.now(),
+      error: e instanceof Error ? e.message : "Live train feed unavailable",
+    });
   }
 }

@@ -2,6 +2,8 @@
 # ==============================
 # Dependencies
 # ==============================
+node_modules/
+
 
 node_modules/
 .next/
@@ -107,5 +109,3 @@ cypress/screenshots/
 *.bak
 *.orig
 *.lockb
-node_modules/
-.next/
